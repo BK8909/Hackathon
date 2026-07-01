@@ -8,8 +8,10 @@ app.py — 나의 터빈일지 | 풍력 터빈 손상 탐지 관리자 알람 �
 준비물: best.pt (학습된 모델), severity.py (같은 폴더)
 """
 import time
+from io import BytesIO
 from datetime import datetime
 
+import requests
 import streamlit as st
 import pandas as pd
 from PIL import Image
@@ -19,12 +21,13 @@ from config import MODEL_PATH
 from severity import (
     assess_image,
     GRADE_COLOR, GRADE_BG, GRADE_BORDER,
-    GRADE_ACTION, GRADE_GUIDE, CLASS_ICON,
-    size_label,
+    GRADE_ACTION, GRADE_GUIDE, CLASS_ICON, CLASS_WEIGHT,
+    size_label, score_one,
 )
 
 # ===== 설정 =====
 DISPLAY_CONF_MIN = 0.7          # 화면에 표시할 최소 신뢰도 (판정 로직과는 무관, 표시 전용)
+NTFY_TOPIC = "turbine-alarm-1234"
 
 st.set_page_config(page_title="나의 터빈일지", page_icon="🌀", layout="wide")
 
@@ -36,6 +39,40 @@ st.markdown(
     /* ---------- 전역 배경/텍스트 (다크모드 자동전환으로 인한 흰 텍스트 방지) ---------- */
     .stApp { background: #F4F7FB; color: #111827; }
     section.main > div { padding-top: 1.2rem; padding-bottom: 2.5rem; }
+    section.main .block-container {
+        width: 100%; max-width: 1600px !important; margin: 0 auto;
+        padding-left: 40px !important; padding-right: 40px !important;
+    }
+    .st-key-result_dashboard {
+        width: 100%; margin: 0 auto;
+    }
+    .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) {
+        width: 100%; display: grid !important;
+        grid-template-columns: minmax(0, 1.8fr) minmax(380px, .9fr) !important;
+        gap: 28px !important; align-items: stretch;
+    }
+    .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"] {
+        width: 100% !important; min-width: 0 !important; height: 100%;
+        display: flex; flex-direction: column; flex: none !important;
+    }
+    /* stColumn stretches to the grid row height natively, but its descendants
+       (Streamlit's own VerticalBlock/LayoutWrapper wrappers) use flex-direction:
+       column with flex-grow:0 by default, so they don't pass that height down.
+       A flex-grow chain worked in Chrome but not Safari, so use single-cell CSS
+       Grid instead — grid ROWS stretch to fill by default here, but an implicit
+       grid COLUMN shrinks to content unless explicitly told to fill (each of
+       these wrappers has exactly one child), so grid-template-columns:1fr is
+       required too — width:100% alone isn't enough for the child's track. */
+    .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"] > [data-testid="stVerticalBlock"],
+    .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"] > [data-testid="stVerticalBlock"] > [data-testid="stLayoutWrapper"] {
+        display: grid; grid-template-columns: 1fr; min-height: 0; width: 100%;
+    }
+    .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"]:has(.action-panel-anchor) {
+        min-width: 380px !important;
+    }
+    .st-key-detail_expander_wrap {
+        width: 100%; margin: 18px auto 0;
+    }
     .stApp h1, .stApp h2, .stApp h3, .stApp h4,
     .stApp p, .stApp label, .stApp li { color: #111827; }
     [data-testid="stHeader"] { background: rgba(244, 247, 251, .92); }
@@ -63,14 +100,132 @@ st.markdown(
     }
 
     /* ---------- 공통 카드 스타일 ---------- */
-    .kpi-card, .severity-card, .esc-card, .img-card {
+    .kpi-card, .severity-card, .esc-card, .img-card, .overview-card,
+    .ai-card, .compare-card, .notification-card {
         background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px;
         box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06); padding: 20px;
     }
 
+    /* 관리자 Overview */
+    .overview-wrap { margin: 18px 0; }
+    .overview-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
+    .overview-card { padding: 16px 18px; box-shadow: 0 2px 10px rgba(15,23,42,.05); }
+    .overview-label { color: #64748B; font-size: 11px; font-weight: 700; letter-spacing: .04em; }
+    .overview-value { color: #0F172A; font-size: 22px; font-weight: 800; margin-top: 5px; }
+    .overview-value.grade { color: var(--grade-color); }
+
+    /* AI 의견 / 비교 / 알림 */
+    .ai-card { border-left: 5px solid #2563EB; margin: 0 0 16px; padding: 20px; background: #F8FAFC; box-shadow: 0 4px 16px rgba(15,23,42,.06); }
+    .ai-title, .compare-title, .notification-title {
+        color: #0F172A; font-size: 16px; font-weight: 700; margin-bottom: 8px;
+    }
+    .ai-copy { color: #334155; font-size: 14px; line-height: 1.7; }
+    .notification-card { margin: 16px 0; padding: 14px 16px; background: #F8FAFC; border-color: #E2E8F0; }
+    .notification-result { color: var(--grade-color); font-size: 13px; font-weight: 800; }
+    .notification-meta { color: #64748B; font-size: 11px; margin-top: 4px; }
+    .compare-card { width: 100%; max-width: none; margin: 12px 0 16px; padding: 24px; }
+    .compare-table { display: grid; grid-template-columns: 1fr 1fr 1fr; width: 100%; border: 1px solid #E2E8F0; border-radius: 12px; overflow: hidden; }
+    .compare-cell { padding: 10px 14px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; color: #334155; font-size: 13px; }
+    .compare-cell:nth-child(3n) { border-right: 0; }
+    .compare-cell:nth-last-child(-n+3) { border-bottom: 0; }
+    .compare-head { background: #F8FAFC; color: #64748B; font-size: 11px; font-weight: 800; }
+    .compare-current { color: #0F172A; font-weight: 800; }
+    .compare-delta { color: var(--delta-color); font-size: 14px; font-weight: 800; margin-top: 3px; }
+    .compare-message { margin-top: 14px; padding: 12px 14px; border-radius: 10px; background: var(--grade-bg); color: #334155; font-size: 13px; line-height: 1.6; }
+    .demo-tag { margin-left: 7px; border-radius: 999px; background: #EFF6FF; color: #2563EB; padding: 2px 7px; font-size: 10px; }
+    .priority-card { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 14px; padding: 20px 22px; background: linear-gradient(135deg,#0F172A,#1E3A5F); border: 1px solid #334155; border-radius: 16px; box-shadow: 0 6px 20px rgba(15,23,42,.16); }
+    .priority-eyebrow { color: #94A3B8; font-size: 11px; font-weight: 700; letter-spacing: .06em; }
+    .priority-id { color: #FFFFFF; font-size: 23px; font-weight: 800; margin-top: 5px; }
+    .priority-metrics { display: flex; align-items: center; gap: 18px; }
+    .priority-metric { color: #E2E8F0; font-size: 13px; }
+    .priority-metric b { color: #FFFFFF; font-size: 17px; margin-left: 5px; }
+    .priority-status { color: var(--grade-color); background: #FFFFFF; border-radius: 999px; padding: 7px 12px; font-size: 12px; font-weight: 800; }
+    .brief-list { margin: 0; padding-left: 18px; color: #334155; font-size: 14px; line-height: 1.55; }
+    .brief-list li { margin-bottom: 4px; }
+    .brief-list li:last-child { margin-bottom: 0; }
+    .brief-actions { margin-top: 12px; padding-top: 11px; border-top: 1px solid #DBEAFE; }
+    .brief-actions-grid { display: grid; grid-template-columns: 1fr 1fr; column-gap: 10px; row-gap: 2px; }
+    .brief-actions-title { color: #1E3A8A; font-size: 12px; font-weight: 800; margin-bottom: 7px; }
+    .brief-action { color: #334155; font-size: 13px; line-height: 1.6; }
+    .alert-checklist { display: grid; gap: 6px; }
+    .alert-done { color: #166534; font-size: 13px; font-weight: 700; }
+    .alert-off { color: #94A3B8; font-size: 13px; }
+    .report-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #E2E8F0; }
+    .report-section-title { color: #0F172A; font-size: 14px; font-weight: 800; }
+    .report-section-sub { color: #64748B; font-size: 11px; margin-top: 2px; }
+    .st-key-side_panel {
+        background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 16px;
+        box-shadow: 0 4px 16px rgba(15,23,42,.06); padding: 20px;
+        width: 100%; min-width: 380px; height: 100%;
+        display: flex; flex-direction: column; gap: 16px;
+    }
+    .st-key-side_panel > [data-testid="stVerticalBlock"],
+    .st-key-side_panel > div > [data-testid="stVerticalBlock"] { gap: 20px; }
+    .st-key-side_panel .severity-card {
+        width: 100%; padding: 20px; border: 1px solid #E2E8F0; border-radius: 16px;
+        box-shadow: 0 4px 16px rgba(15,23,42,.06); margin-bottom: 0;
+    }
+    .st-key-side_panel .ai-card { margin-bottom: 0; }
+    /* Streamlit gives stMarkdownContainer a built-in -16px margin-bottom that
+       cancels the flex `gap` above — neutralize it so cards keep real spacing */
+    .st-key-side_panel [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+    .st-key-detection_card [data-testid="stMarkdownContainer"] { margin-bottom: 0 !important; }
+    .st-key-detection_card > [data-testid="stVerticalBlock"],
+    .st-key-detection_card > div > [data-testid="stVerticalBlock"] { gap: 16px; }
+    [data-testid="stExpander"]:has(.detail-anchor) {
+        margin-top: 12px; margin-bottom: 12px;
+        border: 1px solid #E2E8F0 !important; border-radius: 16px !important;
+        box-shadow: 0 4px 16px rgba(15,23,42,.06); overflow: hidden;
+    }
+    [data-testid="stExpander"]:has(.detail-anchor) summary {
+        padding: 16px 22px; background: #F8FAFC;
+    }
+    [data-testid="stExpander"]:has(.detail-anchor) summary:hover { background: #F1F5F9; }
+    [data-testid="stExpander"]:has(.detail-anchor) summary p {
+        font-size: 14.5px; font-weight: 800; color: #0F172A;
+    }
+    [data-testid="stExpander"]:has(.detail-anchor) [data-testid="stExpanderDetails"] {
+        padding: 22px; border-top: 1px solid #E2E8F0; background: #FFFFFF;
+    }
+    .st-key-stats_wrap {
+        padding: 16px 0 28px;
+    }
+    .st-key-stats_wrap .kpi-card {
+        margin-top: 16px;
+    }
+    [data-testid="stDownloadButton"] button { min-height: 46px; font-weight: 800; border-radius: 10px; }
+    .action-grid-anchor { height: 0; }
+    .st-key-action_grid [data-testid="stHorizontalBlock"] {
+        gap: 10px;
+    }
+    .st-key-action_grid button { min-height: 44px; height: 44px; }
+    @media (max-width: 1100px) {
+        .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) {
+            grid-template-columns: minmax(0, 1fr) !important;
+        }
+        .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"]:has(.action-panel-anchor),
+        .st-key-side_panel { min-width: 0 !important; }
+        .st-key-detection_image_wrap [data-testid="stImage"] { height: auto; }
+        .st-key-detection_image_wrap [data-testid="stImage"] img {
+            height: auto !important; object-fit: contain;
+        }
+    }
+    @media (max-width: 850px) {
+        .overview-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .priority-card, .priority-metrics { align-items: flex-start; flex-direction: column; }
+        .brief-actions-grid { grid-template-columns: 1fr; }
+        section.main .block-container { padding-left: 18px !important; padding-right: 18px !important; }
+        .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) {
+            grid-template-columns: minmax(0, 1fr) !important;
+        }
+        .st-key-result_dashboard [data-testid="stHorizontalBlock"]:has(.detection-card-anchor):has(.action-panel-anchor) > [data-testid="stColumn"]:has(.action-panel-anchor) {
+            min-width: 0 !important;
+        }
+    }
+
     /* KPI 카드 */
     .kpi-card {
-        padding: 16px 18px;
+        padding: 20px 18px;
         transition: transform .15s ease, box-shadow .15s ease;
     }
     .kpi-card:hover {
@@ -84,8 +239,17 @@ st.markdown(
 
     /* 심각도 카드 (등급별 좌측 border 컬러는 --grade-color 로 주입) */
     .severity-card {
-        border-left: 7px solid var(--grade-color);
+        background: #FFFFFF; border: 1px solid #E2E8F0;
+        border-left: 6px solid var(--grade-color); box-shadow: 0 8px 24px rgba(15,23,42,.06);
     }
+    .severity-card.grade-normal { border-left-color: #16A34A; background: #FFFFFF; }
+    .severity-card.grade-watch { border-left-color: #D97706; background: #FFFFFF; }
+    .severity-card.grade-caution { border-left-color: #EA580C; background: #FFFFFF; }
+    .severity-card.grade-danger { border-left-color: #DC2626; background: #FFFFFF; }
+    .severity-card.grade-normal .severity-grade { color: #16A34A; }
+    .severity-card.grade-watch .severity-grade { color: #D97706; }
+    .severity-card.grade-caution .severity-grade { color: #EA580C; }
+    .severity-card.grade-danger .severity-grade { color: #DC2626; }
     .severity-top { display: flex; align-items: center; gap: 10px; }
     .severity-emoji { font-size: 26px; }
     .severity-grade { font-size: 22px; font-weight: 800; color: var(--grade-color); }
@@ -93,14 +257,14 @@ st.markdown(
     .severity-score-label { font-size: 12px; color: #64748B; font-weight: 600; text-transform: uppercase; }
     .severity-score-value { font-size: 30px; font-weight: 800; color: #0F172A; }
     .severity-action {
-        margin-top: 10px; font-size: 13px; color: #334155; background: var(--grade-bg);
-        border: 1px solid var(--grade-border); border-radius: 8px; padding: 8px 12px;
+        margin-top: 14px; font-size: 13px; color: #334155; background: #F8FAFC;
+        border: none; border-radius: 10px; padding: 10px 12px;
     }
 
     /* 리포트(자동 보고서) 카드 — 어두운 카드이므로 흰 글씨 사용 (예외 허용 영역) */
     .report-card {
         background: #0F172A; color: #E2E8F0; border-radius: 16px; padding: 20px;
-        margin-top: 18px; font-size: 13px; box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+        margin-top: 18px; margin-bottom: 24px; font-size: 13px; box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
     }
     .report-card .report-title {
         display: flex; justify-content: space-between; align-items: center;
@@ -208,15 +372,44 @@ st.markdown(
     [data-testid="stElementContainer"]:has(.severity-card) +
     [data-testid="stElementContainer"] [data-testid="stExpander"] { margin-top: 12px; }
 
-    /* ---------- 탐지 이미지 카드 ---------- */
-    [data-testid="stImage"] {
-        background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px;
-        padding: 10px; box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+    /* ---------- 탐지 결과 카드 ---------- */
+    .st-key-detection_card {
+        width: 100%; background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 16px;
+        box-shadow: 0 4px 16px rgba(15,23,42,.06); min-height: 0; height: 100%;
+        display: flex; flex-direction: column; justify-content: center;
+        padding: 28px !important;
     }
-    [data-testid="stImage"] img {
-        max-height: 560px; width: 100%; object-fit: contain; border-radius: 12px;
+    .st-key-detection_card .section-title {
+        margin: 0 0 18px; text-align: left; font-size: 18px; font-weight: 700;
     }
-    [data-testid="stCaptionContainer"], .stCaption { color: #64748B !important; }
+    .st-key-detection_image_wrap [data-testid="stImage"] {
+        width: 100%; height: 520px; max-width: none; margin: 0 auto;
+        display: flex; align-items: center; justify-content: center; overflow: hidden;
+        background: #F8FAFC; border: 0; border-radius: 16px; padding: 0; box-shadow: none;
+    }
+    .st-key-detection_image_wrap [data-testid="stImageContainer"] {
+        width: 100%; height: 100%;
+    }
+    .st-key-detection_image_wrap [data-testid="stImage"] img {
+        display: block; max-height: none; max-width: 100%; width: 100% !important;
+        height: 100% !important; margin: 0 auto; object-fit: cover; object-position: center;
+        border-radius: 14px;
+    }
+    .st-key-detection_image_wrap [data-testid="stCaptionContainer"],
+    .st-key-detection_image_wrap .stCaption {
+        width: 100%; max-width: none; margin: 12px auto 0; color: #64748B !important;
+        font-size: 13px; text-align: center; justify-content: center;
+    }
+    .st-key-detection_image_wrap {
+        width: 100%; max-width: 980px; margin: 0 auto;
+    }
+    @media (max-width: 1100px) {
+        .st-key-detection_image_wrap [data-testid="stImage"] { height: auto; }
+        .st-key-detection_image_wrap [data-testid="stImage"] img {
+            height: auto !important; object-fit: contain;
+        }
+        .st-key-detection_card, .st-key-side_panel { height: auto; }
+    }
 
     /* ---------- 데이터프레임(표) 라이트 스타일 ---------- */
     [data-testid="stDataFrame"] {
@@ -291,6 +484,200 @@ def kpi_card(icon, label, value):
     )
 
 
+def notification_result(grade):
+    """등급별 알림 시뮬레이션 문구."""
+    return {
+        "정상": "🟢 점검 로그 저장 완료",
+        "관찰": "🟡 관리자 대시보드 등록 완료",
+        "주의": "🟠 현장 담당자 이메일 발송 완료",
+        "위험": "🔴 Slack 긴급알림 발송 완료",
+    }[grade]
+
+
+def make_ntfy_message(assessment):
+    """ntfy 알림 본문 생성 — 등급에 따라 첫 줄만 바뀐다."""
+    grade = assessment["grade"]
+
+    level_map = {
+        "정상": "🟢 정상 (Lv0)",
+        "관찰": "🟡 관찰 (Lv1)",
+        "주의": "⚠️ 주의 (Lv2)",
+        "위험": "🔴 위험 (Lv3)",
+    }
+
+    action_map = {
+        "정상": "정상 운영 유지",
+        "관찰": "정기 점검 시 확인",
+        "주의": "24시간 내 현장 점검 계획 수립",
+        "위험": "즉시 현장 확인 및 관리자 보고",
+    }
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    return f"""{level_map[grade]}
+
+터빈 : {assessment["turbine_id"]}
+위험도 : {assessment["score"]}
+
+Damage : {assessment["n_damage"]}건
+Dirt : {assessment["n_dirt"]}건
+재확인 : {assessment["recheck"]}건
+
+권장조치
+{action_map[grade]}
+
+{now}
+"""
+
+
+def send_ntfy_alert(assessment):
+    """현재 분석 결과를 ntfy 푸시 알림으로 발송한다."""
+    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+
+    title = f"{assessment['emoji']} {assessment['grade']} - {assessment['turbine_id']}"
+    message = make_ntfy_message(assessment)
+
+    headers = {
+        # HTTP header values must be latin-1; Title has Korean text and an emoji,
+        # so it must go over the wire as UTF-8 bytes or requests raises
+        # UnicodeEncodeError when sending (ntfy decodes byte header values as UTF-8).
+        "Title": title.encode("utf-8"),
+        "Tags": "warning,wind_turbine",
+        "Priority": "4" if assessment["grade"] in ["주의", "위험"] else "3",
+    }
+
+    response = requests.post(
+        url,
+        data=message.encode("utf-8"),
+        headers=headers,
+        timeout=5,
+    )
+    response.raise_for_status()
+    return True
+
+
+def ai_briefing(result, previous):
+    """관리자가 빠르게 읽을 수 있는 점검 요약과 우선 작업을 생성한다."""
+    score_delta = result["score"] - previous["위험도"]
+    if score_delta > 0:
+        trend = "이전 점검 대비 위험도가 증가했습니다."
+    elif score_delta < 0:
+        trend = "이전 점검 대비 위험도가 감소했습니다."
+    else:
+        trend = "이전 점검 대비 위험도가 유지되었습니다."
+    summary = [
+        f"Damage {result['n_damage']}건이 탐지되었습니다.",
+        f"Dirt {result['n_dirt']}건이 탐지되었습니다." if result["n_dirt"] else "Dirt는 탐지되지 않았습니다.",
+        trend,
+        "재확인 대상이 존재합니다." if result["recheck"] else "재확인 대상은 없습니다.",
+    ]
+    actions = [
+        "탐지 영역 현장 확인",
+        "점검 계획에 탐지 결과 반영",
+        "재확인 대상 우선 검토",
+        "다음 점검 결과와 변화 비교",
+    ]
+    return summary, actions
+
+
+def comparison_message(result, previous):
+    score_delta = result["score"] - previous["위험도"]
+    damage_delta = result["n_damage"] - previous["Damage"]
+    if damage_delta > 0:
+        return "⚠ 손상이 증가하고 있습니다. 점검 우선순위를 높이는 것을 권장합니다."
+    if score_delta > 0:
+        return "⚠ 위험도가 상승했습니다. 동일 부위의 변화 추적과 현장 확인을 권장합니다."
+    if score_delta < 0:
+        return "✓ 위험도가 감소했습니다. 정기 점검을 통해 개선 추세를 확인하세요."
+    return "✓ 이전 점검과 동일한 수준입니다. 현재 점검 주기를 유지하세요."
+
+
+def make_inspection_pdf(result, plotted_image, inspected_at):
+    """현장 제출용 PDF 점검보고서를 메모리에서 생성한다."""
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.platypus import (
+        Image as ReportImage,
+        Paragraph,
+        SimpleDocTemplate,
+        Spacer,
+        Table,
+        TableStyle,
+    )
+
+    font_name = "HYSMyeongJo-Medium"
+    if font_name not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+
+    pdf_buffer = BytesIO()
+    document = SimpleDocTemplate(
+        pdf_buffer, pagesize=A4, rightMargin=18 * mm, leftMargin=18 * mm,
+        topMargin=16 * mm, bottomMargin=16 * mm,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "KoreanTitle", parent=styles["Title"], fontName=font_name,
+        fontSize=20, leading=27, textColor=colors.HexColor("#0F172A"),
+        alignment=TA_CENTER, spaceAfter=4 * mm,
+    )
+    subtitle_style = ParagraphStyle(
+        "KoreanSubtitle", parent=styles["Normal"], fontName=font_name,
+        fontSize=11, leading=16, textColor=colors.HexColor("#475569"),
+        alignment=TA_CENTER, spaceAfter=8 * mm,
+    )
+    body_style = ParagraphStyle(
+        "KoreanBody", parent=styles["Normal"], fontName=font_name,
+        fontSize=10, leading=15, textColor=colors.HexColor("#111827"),
+    )
+
+    story = [
+        Paragraph("나의 터빈일지", title_style),
+        Paragraph("풍력터빈 점검보고서 · 현장 제출용", subtitle_style),
+    ]
+    report_data = [
+        ["점검일시", inspected_at.strftime("%Y-%m-%d %H:%M:%S")],
+        ["터빈 ID", result["turbine_id"]],
+        ["Damage", f"{result['n_damage']}건"],
+        ["Dirt", f"{result['n_dirt']}건"],
+        ["위험도", f"{result['score']:.1f}"],
+        ["등급", result["grade"]],
+        ["권장조치", GRADE_ACTION[result["grade"]]],
+    ]
+    table = Table(report_data, colWidths=[38 * mm, 118 * mm])
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), font_name),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F8FAFC")),
+        ("TEXTCOLOR", (0, 0), (0, -1), colors.HexColor("#334155")),
+        ("TEXTCOLOR", (1, 0), (1, -1), colors.HexColor("#111827")),
+        ("GRID", (0, 0), (-1, -1), .5, colors.HexColor("#E2E8F0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.extend([table, Spacer(1, 8 * mm), Paragraph("탐지 결과 이미지", body_style), Spacer(1, 3 * mm)])
+
+    image_buffer = BytesIO()
+    Image.fromarray(plotted_image).save(image_buffer, format="PNG")
+    image_buffer.seek(0)
+    report_image = ReportImage(image_buffer)
+    max_width, max_height = 156 * mm, 105 * mm
+    scale = min(max_width / report_image.imageWidth, max_height / report_image.imageHeight)
+    report_image.drawWidth = report_image.imageWidth * scale
+    report_image.drawHeight = report_image.imageHeight * scale
+    story.append(report_image)
+    document.build(story)
+    pdf_buffer.seek(0)
+    return pdf_buffer.getvalue()
+
+
 # 세션에 점검 이력 저장 (터빈일지)
 if "history" not in st.session_state:
     st.session_state.history = []
@@ -350,102 +737,203 @@ if uploaded:
 
     st.write("")
 
+    inspected_at = datetime.now()
+    previous = next(
+        (item for item in st.session_state.history if item["터빈"] == turbine_id),
+        {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+    )
+    is_demo_previous = not any(
+        item["터빈"] == turbine_id for item in st.session_state.history
+    )
+
+    # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
+    display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
+    # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
+    plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
+    grade_bg, grade_border = GRADE_BG[grade], GRADE_BORDER[grade]
+    css_vars = f"--grade-color:{color};--grade-bg:{grade_bg};--grade-border:{grade_border};"
+    grade_class = {
+        "정상": "grade-normal", "관찰": "grade-watch",
+        "주의": "grade-caution", "위험": "grade-danger",
+    }[grade]
+
+    # ===== 관리자 Overview =====
+    st.markdown(
+        f"""<div class="overview-wrap fade-in" style="{css_vars}">
+                <div class="section-title">관리자 Overview</div>
+                <div class="overview-grid">
+                    <div class="overview-card"><div class="overview-label">오늘 점검</div><div class="overview-value">1기</div></div>
+                    <div class="overview-card"><div class="overview-label">현재 위험</div><div class="overview-value grade">{result['emoji']} {grade}</div></div>
+                    <div class="overview-card"><div class="overview-label">Damage</div><div class="overview-value">{result['n_damage']}건</div></div>
+                    <div class="overview-card"><div class="overview-label">Dirt</div><div class="overview-value">{result['n_dirt']}건</div></div>
+                    <div class="overview-card"><div class="overview-label">재확인</div><div class="overview-value">{result['recheck']}건</div></div>
+                </div>
+                <div class="priority-card">
+                    <div><div class="priority-eyebrow">★★★★★ 오늘 우선 점검 대상</div><div class="priority-id">{turbine_id}</div></div>
+                    <div class="priority-metrics">
+                        <div class="priority-metric">위험도 <b>{result['score']:.1f}</b></div>
+                        <div class="priority-status">{result['emoji']} {grade}</div>
+                    </div>
+                </div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
+
     # ===== 결과: 좌(이미지) 우(판정) =====
-    col_img, col_res = st.columns([3, 2], gap="large")
+    result_dashboard = st.container(key="result_dashboard")
+    col_img, col_res = result_dashboard.columns([2, 1], gap="medium")
+    detail_expander_host = st.container(key="detail_expander_wrap")
 
     with col_img:
-        st.markdown("<div class='section-title'>탐지 결과</div>", unsafe_allow_html=True)
-        # 화면에는 신뢰도 0.7 이상 탐지만 표시 (심각도 계산은 원본 결과 기준 유지)
-        display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
-        plotted = display_res.plot()[:, :, ::-1]
-        st.image(plotted, width="stretch")
-        st.caption(f"신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지 결과만 화면에 표시됩니다. "
-                   "낮은 확신도는 재확인 대상으로 분류됩니다.")
+        with st.container(border=True, key="detection_card"):
+            st.markdown(
+                "<div class='detection-card-anchor'></div>"
+                "<div class='section-title'>탐지 결과</div>",
+                unsafe_allow_html=True,
+            )
+            with st.container(key="detection_image_wrap"):
+                st.image(plotted, width="stretch")
+                st.caption(f"※ 화면에는 신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지만 표시됩니다.")
 
     with col_res:
-        grade_bg, grade_border = GRADE_BG[grade], GRADE_BORDER[grade]
-        css_vars = f"--grade-color:{color};--grade-bg:{grade_bg};--grade-border:{grade_border};"
+        briefing_points, briefing_actions = ai_briefing(result, previous)
+        pdf_bytes = make_inspection_pdf(result, plotted, inspected_at)
+        safe_turbine_id = "".join(char for char in turbine_id if char.isalnum()) or "Turbine"
+        with st.container(border=True, key="side_panel"):
+            st.markdown(
+                f"""<div class="action-panel-anchor"></div>
+                    <div class="severity-card {grade_class} fade-in" style="{css_vars}">
+                        <div class="severity-top"><span class="severity-emoji">{result['emoji']}</span><span class="severity-grade">{grade}</span></div>
+                        <div class="severity-score-row"><span class="severity-score-label">위험도</span><span class="severity-score-value">{result['score']}</span></div>
+                        <div class="severity-action">권장 조치: {GRADE_ACTION[grade]}</div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
 
-        # --- 심각도 카드 ---
-        st.markdown(
-            f"""<div class="severity-card fade-in" style="{css_vars}">
-                    <div class="severity-top">
-                        <span class="severity-emoji">{result['emoji']}</span>
-                        <span class="severity-grade">{grade}</span>
-                    </div>
-                    <div class="severity-score-row">
-                        <span class="severity-score-label">위험도</span>
-                        <span class="severity-score-value">{result['score']}</span>
-                    </div>
-                    <div class="severity-action">권장 조치 · {GRADE_ACTION[grade]}</div>
-                </div>""",
-            unsafe_allow_html=True,
-        )
+            summary_html = "".join(f"<li>{item}</li>" for item in briefing_points)
+            actions_html = "".join(
+                f"<div class='brief-action'>{index} {item}</div>"
+                for index, item in zip(["①", "②", "③", "④"], briefing_actions)
+            )
+            st.markdown(
+                f"""<div class="ai-card fade-in">
+                        <div class="ai-title">🤖 AI 점검 브리핑</div>
+                        <ul class="brief-list">{summary_html}</ul>
+                        <div class="brief-actions"><div class="brief-actions-title">우선 권장 작업</div><div class="brief-actions-grid">{actions_html}</div></div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
 
-        with st.expander("ℹ️ 등급 기준 안내"):
+            dashboard_done = grade in ["관찰", "주의", "위험"]
+            email_done = grade in ["주의", "위험"]
+            sms_done = grade == "위험"
+            st.markdown(
+                "<div class='report-section'><div class='report-section-title'>다음 작업</div></div>",
+                unsafe_allow_html=True,
+            )
+            with st.container(key="action_grid"):
+                st.markdown("<div class='action-grid-anchor'></div>", unsafe_allow_html=True)
+                action_col1, action_col2 = st.columns(2)
+                with action_col1:
+                    st.download_button(
+                        "⬇ PDF 다운로드", data=pdf_bytes,
+                        file_name=f"Inspection_Report_{safe_turbine_id}.pdf",
+                        mime="application/pdf", width="stretch",
+                    )
+                with action_col2:
+                    if st.button("🔔 담당자 알림", width="stretch", key="notify_manager"):
+                        try:
+                            send_ntfy_alert(result)
+                            st.session_state.ntfy_status = ("success", None)
+                        except Exception as e:
+                            st.session_state.ntfy_status = ("error", str(e))
+
+                ntfy_status = st.session_state.get("ntfy_status")
+                if ntfy_status is None:
+                    st.caption("외부 채널 연동 전")
+                elif ntfy_status[0] == "success":
+                    st.success("ntfy 담당자 알림 발송 완료")
+                else:
+                    st.error(f"알림 발송 실패: {ntfy_status[1]}")
+
+                if st.button("📅 현장점검 예약", width="stretch", key="schedule_inspection"):
+                    st.toast("현장점검 예약 요청이 등록되었습니다. (시뮬레이션)")
+
+        # 상세 정보는 필요할 때만 펼친다.
+        with detail_expander_host.expander("📋 상세보기 · 등급 기준 / 계산 근거 / 검사 결과 / 통계"):
+            st.markdown("<div class='detail-anchor'></div>", unsafe_allow_html=True)
+            st.markdown(
+                f"""<div class="notification-card" style="{css_vars}">
+                        <div class="notification-title">알림 발송 결과</div>
+                        <div class="alert-checklist">
+                            <div class="{'alert-done' if dashboard_done else 'alert-off'}">{'✔' if dashboard_done else '○'} Dashboard {'등록 완료' if dashboard_done else '미등록'}</div>
+                            <div class="{'alert-done' if email_done else 'alert-off'}">{'✔' if email_done else '○'} Email {'발송 완료' if email_done else '미발송'}</div>
+                            <div class="{'alert-done' if sms_done else 'alert-off'}">{'✔' if sms_done else '○'} SMS {'발송 완료' if sms_done else '미사용'}</div>
+                        </div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+            st.markdown("**등급 기준**")
             for g in ["정상", "관찰", "주의", "위험"]:
                 st.markdown(
-                    f"<div class='legend-row'>"
-                    f"<span class='legend-dot' style='background:{GRADE_COLOR[g]}'></span>"
-                    f"<b>{g}</b> — {GRADE_GUIDE[g]}</div>",
+                    f"<div class='legend-row'><span class='legend-dot' style='background:{GRADE_COLOR[g]}'></span><b>{g}</b> — {GRADE_GUIDE[g]}</div>",
                     unsafe_allow_html=True,
                 )
 
-        # --- 자동 보고서 카드 ---
-        st.markdown(
-            f"""<div class="report-card fade-in">
-                    <div class="report-title">점검 결과 <span class="report-badge">AUTO REPORT</span></div>
-                    <div class="report-row"><span>터빈</span><span>{turbine_id}</span></div>
-                    <div class="report-row"><span>Damage</span><span>{result['n_damage']}건</span></div>
-                    <div class="report-row"><span>Dirt</span><span>{result['n_dirt']}건</span></div>
-                    <div class="report-row"><span>위험도</span><span>{result['score']}</span></div>
-                    <div class="report-row"><span>권장조치</span><span>{GRADE_GUIDE[grade]}</span></div>
-                    <div class="report-row"><span>시간</span><span>{datetime.now().strftime('%Y-%m-%d %H:%M')}</span></div>
-                </div>""",
-            unsafe_allow_html=True,
-        )
+            st.markdown("**위험도 계산 근거**")
+            st.caption("객체별 점수 = 클래스 가중치 × (1 + Bounding Box 면적비 × 5) × 모델 신뢰도")
+            score_rows = []
+            for index, detection in enumerate(result["counted"], start=1):
+                score_rows.append({
+                    "객체": f"{detection['label']} #{index}", "가중치": CLASS_WEIGHT[detection["cls"]],
+                    "면적비": f"{detection['area_ratio'] * 100:.2f}%", "신뢰도": f"{detection['conf'] * 100:.1f}%",
+                    "기여 점수": round(score_one(detection["cls"], detection["area_ratio"], detection["conf"]), 1),
+                })
+            if score_rows:
+                st.dataframe(pd.DataFrame(score_rows), width="stretch", hide_index=True, row_height=32)
+            else:
+                st.caption("위험도에 반영된 고신뢰도 탐지가 없습니다.")
+            st.markdown(f"**총 위험도: {result['score']:.1f}점**")
 
-        st.write("")
+            st.markdown(
+                f"""<div class="report-card">
+                        <div class="report-title">검사 결과 <span class="report-badge">AUTO REPORT · Generated by AI</span></div>
+                        <div class="report-row"><span>터빈</span><span>{turbine_id}</span></div>
+                        <div class="report-row"><span>Damage / Dirt</span><span>{result['n_damage']} / {result['n_dirt']}건</span></div>
+                        <div class="report-row"><span>위험도 / 등급</span><span>{result['score']} / {grade}</span></div>
+                        <div class="report-row"><span>권장조치</span><span>{GRADE_GUIDE[grade]}</span></div>
+                    </div>""",
+                unsafe_allow_html=True,
+            )
+            with st.container(key="stats_wrap"):
+                st.markdown("<div class='stats-anchor'></div>", unsafe_allow_html=True)
+                stat1, stat2, stat3 = st.columns(3)
+                with stat1:
+                    kpi_card(CLASS_ICON["Damage"], "Damage", f"{result['n_damage']}건")
+                with stat2:
+                    kpi_card(CLASS_ICON["Dirt"], "Dirt", f"{result['n_dirt']}건")
+                with stat3:
+                    kpi_card("👁", "재확인", f"{result['recheck']}건")
 
-        # --- KPI 카드 ---
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            kpi_card(CLASS_ICON["Damage"], "Damage", f"{result['n_damage']}건")
-        with c2:
-            kpi_card(CLASS_ICON["Dirt"], "Dirt", f"{result['n_dirt']}건")
-        with c3:
-            kpi_card("👁", "재확인", f"{result['recheck']}건")
-
-        st.write("")
-
-        # --- 에스컬레이션 카드 ---
-        ch_badges = render_chips(channel_badges(result["channels"]))
-        tg_badges = render_chips(target_badges(result["targets"])) or (
-            "<span class='chip'>없음</span>"
-        )
-        if grade == "정상":
-            note = "🟢 이상 없음 — 로그에만 기록됩니다."
-        elif grade == "위험":
-            note = "🚨 즉시 발송 예정"
-        elif grade == "주의":
-            note = "📧 발송 예정"
-        else:
-            note = "📊 대시보드 표시 예정"
-
-        st.markdown(
-            f"""<div class="esc-card fade-in" style="{css_vars}">
-                    <div class="esc-header">📢 알림 정책</div>
-                    <div class="esc-row"><div class="esc-row-label">채널</div>{ch_badges}</div>
-                    <div class="esc-row"><div class="esc-row-label">대상</div>{tg_badges}</div>
-                    <div class="esc-note">{note}</div>
-                </div>""",
-            unsafe_allow_html=True,
-        )
-
-        if result["recheck"] > 0:
-            st.caption(f"⚠️ 확신도 낮은 탐지 {result['recheck']}건은 자동 판정에서 제외 — 담당자 재확인 권장")
-
-    st.write("")
+    # ===== 이전 점검 대비 =====
+    score_delta = result["score"] - previous["위험도"]
+    delta_symbol = "▲" if score_delta > 0 else "▼" if score_delta < 0 else "―"
+    delta_color = "#DC2626" if score_delta > 0 else "#16A34A" if score_delta < 0 else "#64748B"
+    previous_tag = "<span class='demo-tag'>DEMO BASELINE</span>" if is_demo_previous else ""
+    st.markdown(
+        f"""<div class="compare-card fade-in" style="{css_vars}--delta-color:{delta_color};">
+                <div class="compare-title">이전 점검 대비 {previous_tag}</div>
+                <div class="compare-table">
+                    <div class="compare-cell compare-head">항목</div><div class="compare-cell compare-head">이전</div><div class="compare-cell compare-head">현재</div>
+                    <div class="compare-cell">위험도</div><div class="compare-cell">{previous['위험도']:.1f}</div><div class="compare-cell compare-current">{result['score']:.1f} <span class="compare-delta">{delta_symbol} {score_delta:+.1f}</span></div>
+                    <div class="compare-cell">Damage</div><div class="compare-cell">{previous['Damage']}건</div><div class="compare-cell compare-current">{result['n_damage']}건</div>
+                    <div class="compare-cell">Dirt</div><div class="compare-cell">{previous['Dirt']}건</div><div class="compare-cell compare-current">{result['n_dirt']}건</div>
+                    <div class="compare-cell">판정</div><div class="compare-cell">{previous['등급']}</div><div class="compare-cell compare-current">{result['emoji']} {grade}</div>
+                </div>
+                <div class="compare-message">{comparison_message(result, previous)}</div>
+            </div>""",
+        unsafe_allow_html=True,
+    )
 
     # ===== 탐지 상세 표 =====
     if result["counted"] or result["recheck_list"]:
@@ -465,7 +953,7 @@ if uploaded:
                 "신뢰도": f"{d['conf']*100:.0f}%",
                 "처리": "⚠ 재확인",
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, row_height=32)
 
     # ===== 점검 이력 기록 =====
     st.session_state.history.insert(0, {
@@ -493,7 +981,7 @@ if st.session_state.history:
 
     st.dataframe(
         df.style.apply(_tint_row, axis=1),
-        width="stretch", hide_index=True,
+        width="stretch", hide_index=True, row_height=32,
         column_config={"위험도": st.column_config.NumberColumn("위험도", format="%.1f")},
     )
 else:

@@ -9,3 +9,9 @@ numpy>=1.26,<3
 
 # Data handling
 pandas>=2.2,<4
+
+# PDF reports
+reportlab>=4.2,<5
+
+# Push notifications
+requests>=2.31,<3
