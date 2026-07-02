@@ -11,6 +11,7 @@ import base64
 import shutil
 import subprocess
 import time
+import uuid
 from io import BytesIO
 from datetime import datetime
 
@@ -1056,114 +1057,131 @@ if uploaded:
     is_video = file_ext in VIDEO_TYPES
     st.session_state.pop("selected_history_id", None)  # 새 업로드가 불러오기 화면보다 우선한다
 
-    # ===== 순차 진행 상태 표시 =====
-    with st.status("분석 진행 중...", expanded=True) as status:
-        if is_video:
-            st.write("🎞️ 영상 로드 중...")
-            tmp_path = f"_tmp_upload.{file_ext}"
-            with open(tmp_path, "wb") as f:
-                f.write(uploaded.getbuffer())
+    # 이 파일(+터빈ID)을 이미 분석했으면 재실행하지 않는다. history 표에서
+    # 체크박스를 클릭하는 것처럼 무관한 위젯 조작도 스크립트 전체를
+    # 재실행시키는데, uploaded는 그대로 남아있으므로 이 캐시가 없으면 매번
+    # YOLO 추론을 다시 돌리고 공유 이력에도 중복으로 기록된다.
+    session_tag = st.session_state.setdefault("session_tag", uuid.uuid4().hex[:8])
+    current_analysis_key = f"{turbine_id}:{uploaded.file_id}"
+
+    if st.session_state.get("last_analysis_key") != current_analysis_key:
+        # ===== 순차 진행 상태 표시 =====
+        with st.status("분석 진행 중...", expanded=True) as status:
+            if is_video:
+                st.write("🎞️ 영상 로드 중...")
+                tmp_path = f"_tmp_upload_{session_tag}.{file_ext}"
+                with open(tmp_path, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                time.sleep(0.3)
+
+                st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
+                result = assess_video(
+                    model, tmp_path, turbine_id=turbine_id,
+                    sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
+                )
+                yolo_res = result["yolo_result"]
+                st.write(
+                    f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
+                    f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
+                )
+                time.sleep(0.3)
+
+                st.write("🎬 탐지 결과 타임랩스 영상 생성 중...")
+                frame_plots_bgr = [
+                    fr["yolo_result"][fr["yolo_result"].boxes.conf >= DISPLAY_CONF_MIN]
+                    .plot(line_width=2, font_size=13)
+                    for fr in result["frame_results"]
+                ]
+                # 세션마다 고유한 파일명 — 동시에 접속한 다른 관리자의 분석과
+                # 같은 임시 파일을 공유하면 서로의 결과가 덮어써질 수 있다.
+                output_video_path = f"_tmp_detection_timelapse_{session_tag}.mp4"
+                try:
+                    encode_frames_to_video(frame_plots_bgr, VIDEO_OUTPUT_FPS, output_video_path)
+                    result["output_video_path"] = output_video_path
+                except Exception as e:
+                    result["video_encode_error"] = str(e)
+                time.sleep(0.3)
+            else:
+                st.write("🖼️ 이미지 로드 중...")
+                img = Image.open(uploaded).convert("RGB")
+                tmp_path = f"_tmp_upload_{session_tag}.jpg"
+                img.save(tmp_path)
+                time.sleep(0.3)
+
+                st.write("🔎 YOLO 탐지 진행 중...")
+                result = assess_image(model, tmp_path, turbine_id=turbine_id)
+                yolo_res = result["yolo_result"]
+                time.sleep(0.3)
+
+            st.write("📐 심각도 계산 중...")
             time.sleep(0.3)
 
-            st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
-            result = assess_video(
-                model, tmp_path, turbine_id=turbine_id,
-                sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
-            )
-            yolo_res = result["yolo_result"]
-            st.write(
-                f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
-                f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
-            )
+            grade = result["grade"]
+            st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
             time.sleep(0.3)
 
-            st.write("🎬 탐지 결과 타임랩스 영상 생성 중...")
-            frame_plots_bgr = [
-                fr["yolo_result"][fr["yolo_result"].boxes.conf >= DISPLAY_CONF_MIN]
-                .plot(line_width=2, font_size=13)
-                for fr in result["frame_results"]
-            ]
-            output_video_path = "_tmp_detection_timelapse.mp4"
+            st.write("📢 에스컬레이션 정책 확인 중...")
+            time.sleep(0.3)
+
+            status.update(label="분석 완료", state="complete", expanded=False)
+
+        st.write("")
+
+        # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
+        # (이 블록 자체가 파일당 한 번만 실행되므로 별도 중복 방지 키는 필요 없다.)
+        if grade == "위험":
             try:
-                encode_frames_to_video(frame_plots_bgr, VIDEO_OUTPUT_FPS, output_video_path)
-                result["output_video_path"] = output_video_path
+                send_ntfy_alert(result)
+                st.session_state.ntfy_status = ("success", None, True)
             except Exception as e:
-                result["video_encode_error"] = str(e)
-            time.sleep(0.3)
-        else:
-            st.write("🖼️ 이미지 로드 중...")
-            img = Image.open(uploaded).convert("RGB")
-            tmp_path = "_tmp_upload.jpg"
-            img.save(tmp_path)
-            time.sleep(0.3)
+                st.session_state.ntfy_status = ("error", str(e), True)
 
-            st.write("🔎 YOLO 탐지 진행 중...")
-            result = assess_image(model, tmp_path, turbine_id=turbine_id)
-            yolo_res = result["yolo_result"]
-            time.sleep(0.3)
+        inspected_at = datetime.now()
+        shared_history = load_history()
+        previous = next(
+            (item for item in shared_history if item["터빈"] == turbine_id),
+            {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+        )
+        is_demo_previous = not any(item["터빈"] == turbine_id for item in shared_history)
 
-        st.write("📐 심각도 계산 중...")
-        time.sleep(0.3)
+        # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
+        display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
+        # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
+        plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
 
-        grade = result["grade"]
-        st.write(f"{result['emoji']} 등급 판정 완료 — {grade}")
-        time.sleep(0.3)
+        # ===== 공유 점검 이력에 기록 (모든 관리자가 함께 봄) =====
+        add_history_entry({
+            "시각": inspected_at.strftime("%H:%M:%S"),
+            "날짜": inspected_at.strftime("%Y-%m-%d"),
+            "터빈": turbine_id,
+            "등급": f"{result['emoji']} {grade}",
+            "위험도": result["score"],
+            "Damage": result["n_damage"],
+            "Dirt": result["n_dirt"],
+            "grade": result["grade"], "emoji": result["emoji"], "score": result["score"],
+            "n_damage": result["n_damage"], "n_dirt": result["n_dirt"], "recheck": result["recheck"],
+            "channels": result["channels"], "targets": result["targets"],
+            "counted": result["counted"], "recheck_list": result["recheck_list"],
+            "source": result.get("source", "image"),
+            "timestamp_sec": result.get("timestamp_sec"),
+            "sampled_frames": result.get("sampled_frames"),
+            "inspected_at": inspected_at.isoformat(),
+            "previous_snapshot": previous,
+            "is_demo_previous": is_demo_previous,
+            "plotted_image_b64": image_to_base64_jpeg(plotted),
+        })
 
-        st.write("📢 에스컬레이션 정책 확인 중...")
-        time.sleep(0.3)
+        st.session_state.last_analysis_key = current_analysis_key
+        st.session_state.last_analysis = {
+            "result": result, "turbine_id": turbine_id, "plotted": plotted,
+            "inspected_at": inspected_at, "previous": previous, "is_demo_previous": is_demo_previous,
+        }
 
-        status.update(label="분석 완료", state="complete", expanded=False)
-
-    st.write("")
-
-    # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
-    # 같은 업로드+터빈ID 조합에서는 재실행(다른 버튼 클릭 등)마다 중복 발송되지
-    # 않도록 file_id로 한 번만 보낸다.
-    auto_alert_key = f"{turbine_id}:{uploaded.file_id}"
-    if grade == "위험" and st.session_state.get("last_auto_alert_key") != auto_alert_key:
-        try:
-            send_ntfy_alert(result)
-            st.session_state.ntfy_status = ("success", None, True)
-        except Exception as e:
-            st.session_state.ntfy_status = ("error", str(e), True)
-        st.session_state.last_auto_alert_key = auto_alert_key
-
-    inspected_at = datetime.now()
-    shared_history = load_history()
-    previous = next(
-        (item for item in shared_history if item["터빈"] == turbine_id),
-        {"위험도": 24.0, "Damage": 1, "Dirt": 2, "등급": "🟠 주의"},
+    cached = st.session_state.last_analysis
+    render_analysis(
+        cached["result"], cached["turbine_id"], cached["plotted"], cached["inspected_at"],
+        cached["previous"], cached["is_demo_previous"],
     )
-    is_demo_previous = not any(item["터빈"] == turbine_id for item in shared_history)
-
-    # 화면 및 PDF에 동일한 고신뢰도 탐지 이미지를 사용
-    display_res = yolo_res[yolo_res.boxes.conf >= DISPLAY_CONF_MIN]
-    # 표시 전용 라벨 크기와 선 두께를 고정해 박스 가장자리의 가독성을 확보한다.
-    plotted = display_res.plot(line_width=2, font_size=13)[:, :, ::-1]
-
-    render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous)
-
-    # ===== 공유 점검 이력에 기록 (모든 관리자가 함께 봄) =====
-    add_history_entry({
-        "시각": inspected_at.strftime("%H:%M:%S"),
-        "날짜": inspected_at.strftime("%Y-%m-%d"),
-        "터빈": turbine_id,
-        "등급": f"{result['emoji']} {grade}",
-        "위험도": result["score"],
-        "Damage": result["n_damage"],
-        "Dirt": result["n_dirt"],
-        "grade": result["grade"], "emoji": result["emoji"], "score": result["score"],
-        "n_damage": result["n_damage"], "n_dirt": result["n_dirt"], "recheck": result["recheck"],
-        "channels": result["channels"], "targets": result["targets"],
-        "counted": result["counted"], "recheck_list": result["recheck_list"],
-        "source": result.get("source", "image"),
-        "timestamp_sec": result.get("timestamp_sec"),
-        "sampled_frames": result.get("sampled_frames"),
-        "inspected_at": inspected_at.isoformat(),
-        "previous_snapshot": previous,
-        "is_demo_previous": is_demo_previous,
-        "plotted_image_b64": image_to_base64_jpeg(plotted),
-    })
 
 elif st.session_state.get("selected_history_id"):
     shared_history = load_history()
@@ -1220,7 +1238,7 @@ if shared_history:
     )
 
     selected_rows = event.selection.rows if event and event.selection else []
-    if selected_rows and not uploaded:
+    if selected_rows:
         selected_entry = df.iloc[selected_rows[0]].to_dict()
         load_col, delete_col = st.columns(2)
         with load_col:
