@@ -159,6 +159,9 @@ def assess_video(
     동영상 경로 → 일정 간격으로 프레임을 샘플링해 각각 탐지하고,
     위험도가 가장 높은 프레임을 대표 결과로 반환한다.
     (정지 이미지 1장을 다루는 assess_image와 동일한 반환 형식 + 프레임 메타데이터)
+
+    반환값의 "frame_results"에는 샘플링한 모든 프레임의 (초, YOLO 결과)가
+    시간순으로 담기며, 탐지 결과를 타임랩스 영상으로 만들 때 사용한다.
     """
     import cv2
 
@@ -170,6 +173,7 @@ def assess_video(
     frame_interval = max(int(round(fps * sample_interval_sec)), 1)
 
     best = None  # (score, result, assessment, frame_index)
+    frame_results = []  # [{"timestamp_sec": ..., "yolo_result": ...}, ...] 시간순
     frame_index = 0
     sampled = 0
     try:
@@ -181,6 +185,10 @@ def assess_video(
                 result = model.predict(frame, conf=conf, verbose=False)[0]
                 dets = detections_from_yolo(result)
                 assessment = assess(dets, turbine_id)
+                frame_results.append({
+                    "timestamp_sec": round(frame_index / fps, 1),
+                    "yolo_result": result,
+                })
                 if best is None or assessment["score"] > best[2]["score"]:
                     best = (result, frame_index, assessment)
                 sampled += 1
@@ -197,6 +205,7 @@ def assess_video(
     assessment["frame_index"] = frame_index
     assessment["timestamp_sec"] = round(frame_index / fps, 1)
     assessment["sampled_frames"] = sampled
+    assessment["frame_results"] = frame_results
     return assessment
 
 
