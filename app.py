@@ -22,7 +22,7 @@ from PIL import Image
 from ultralytics import YOLO
 
 from config import MODEL_PATH
-from history_store import add_history_entry, find_entry, load_history
+from history_store import add_history_entry, delete_entries, find_entry, load_history
 from severity import (
     assess_image, assess_video,
     CLASSES, GRADE_COLOR, GRADE_BG, GRADE_BORDER,
@@ -773,6 +773,35 @@ with st.container(border=True):
     with col_id:
         turbine_id = st.text_input("터빈 ID", value="터빈-03")
 
+
+@st.dialog("테스트 기록 삭제")
+def confirm_delete_history_entry(entry):
+    """공유 이력 삭제는 모든 관리자 화면에 영향을 주므로 확인 팝업을 거친다.
+
+    이 버튼은 데모/테스트 편의용 하드 삭제다. 실서비스에서는 감사(audit)
+    추적이 필요하므로 삭제 대신 아카이브/무효 처리가 적합하다 (README 참고).
+    """
+    st.write(
+        f"**{entry['터빈']}** · {entry.get('날짜', '')} {entry['시각']} · {entry['등급']} "
+        f"(위험도 {entry['위험도']:.1f}) 테스트 기록을 삭제할까요?"
+    )
+    st.caption(
+        "이 목록은 모든 관리자가 함께 봅니다 — 삭제하면 다른 관리자 화면에서도 사라지고 되돌릴 수 없습니다. "
+        "데모 중 만든 테스트 기록을 정리하는 용도입니다."
+    )
+    col_confirm, col_cancel = st.columns(2)
+    with col_confirm:
+        if st.button("🗑️ 테스트 기록 삭제", width="stretch", type="primary"):
+            delete_entries([entry["id"]])
+            if st.session_state.get("selected_history_id") == entry["id"]:
+                st.session_state.pop("selected_history_id", None)
+            st.toast("테스트 기록을 삭제했습니다.")
+            st.rerun()
+    with col_cancel:
+        if st.button("취소", width="stretch"):
+            st.rerun()
+
+
 def render_analysis(result, turbine_id, plotted, inspected_at, previous, is_demo_previous, is_history_view=False):
     """분석 결과 하나를 대시보드로 렌더링한다.
 
@@ -1192,9 +1221,20 @@ if shared_history:
 
     selected_rows = event.selection.rows if event and event.selection else []
     if selected_rows and not uploaded:
-        selected_entry = df.iloc[selected_rows[0]]
-        if st.button(f"🔍 선택한 점검 불러오기 ({selected_entry['터빈']} · {selected_entry['시각']})"):
-            st.session_state["selected_history_id"] = selected_entry["id"]
-            st.rerun()
+        selected_entry = df.iloc[selected_rows[0]].to_dict()
+        load_col, delete_col = st.columns(2)
+        with load_col:
+            if st.button(
+                f"🔍 불러오기 ({selected_entry['터빈']} · {selected_entry['시각']})",
+                width="stretch",
+            ):
+                st.session_state["selected_history_id"] = selected_entry["id"]
+                st.rerun()
+        with delete_col:
+            if st.button(
+                f"🗑️ 테스트 기록 삭제 ({selected_entry['터빈']} · {selected_entry['시각']})",
+                width="stretch",
+            ):
+                confirm_delete_history_entry(selected_entry)
 else:
     st.caption("아직 점검 이력이 없습니다. 이미지나 영상을 업로드하세요.")
