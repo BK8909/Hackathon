@@ -2,10 +2,13 @@
 app.py — 나의 터빈일지 | 풍력 터빈 손상 탐지 관리자 알람 대시보드
 
 실행:
-    pip install streamlit ultralytics
+    pip install -r requirements.txt
     streamlit run app.py
 
-준비물: best.pt (학습된 모델), severity.py (같은 폴더)
+준비물:
+    - best.pt (학습된 YOLO 모델, 같은 폴더)
+    - severity.py, history_store.py, config.py (같은 폴더)
+    - 동영상 탐지 결과 재생에는 시스템 ffmpeg 필요 (자세한 내용은 README 참고)
 """
 import base64
 import shutil
@@ -38,6 +41,7 @@ IMAGE_TYPES = ["jpg", "jpeg", "png"]
 VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
 VIDEO_SAMPLE_INTERVAL_SEC = 1.0  # 동영상에서 프레임을 샘플링할 간격
 VIDEO_MAX_FRAMES = 30            # 동영상당 최대 분석 프레임 수 (데모 환경 처리 시간 보호)
+TURBINE_IDS = [f"터빈-{i:02d}" for i in range(1, 11)]  # 터빈-01 ~ 터빈-10
 VIDEO_OUTPUT_FPS = 2             # 탐지 결과 타임랩스 영상 재생 속도 (샘플링 간격과 무관하게 고정)
 
 
@@ -130,7 +134,6 @@ st.markdown(
     .section-title {
         color: #111827; font-size: 17px; font-weight: 800; margin: 0 0 10px 0;
     }
-    .section-sub { color: #64748B; font-size: 12.5px; margin-top: -6px; margin-bottom: 10px; }
     .input-card-title { color: #111827; font-size: 17px; font-weight: 800; margin-bottom: 2px; }
     .input-card-sub { color: #64748B; font-size: 12.5px; margin-bottom: 8px; }
 
@@ -141,7 +144,7 @@ st.markdown(
     }
 
     /* ---------- 공통 카드 스타일 ---------- */
-    .kpi-card, .severity-card, .esc-card, .img-card, .overview-card,
+    .kpi-card, .severity-card, .overview-card,
     .ai-card, .compare-card, .notification-card {
         background: #FFFFFF; border: 1px solid #E5E7EB; border-radius: 16px;
         box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06); padding: 20px;
@@ -160,10 +163,7 @@ st.markdown(
     .ai-title, .compare-title, .notification-title {
         color: #0F172A; font-size: 16px; font-weight: 700; margin-bottom: 8px;
     }
-    .ai-copy { color: #334155; font-size: 14px; line-height: 1.7; }
     .notification-card { margin: 16px 0; padding: 14px 16px; background: #F8FAFC; border-color: #E2E8F0; }
-    .notification-result { color: var(--grade-color); font-size: 13px; font-weight: 800; }
-    .notification-meta { color: #64748B; font-size: 11px; margin-top: 4px; }
     .compare-card { width: 100%; max-width: none; margin: 12px 0 16px; padding: 24px; }
     .compare-table { display: grid; grid-template-columns: 1fr 1fr 1fr; width: 100%; border: 1px solid #E2E8F0; border-radius: 12px; overflow: hidden; }
     .compare-cell { padding: 10px 14px; border-right: 1px solid #E2E8F0; border-bottom: 1px solid #E2E8F0; color: #334155; font-size: 13px; }
@@ -193,7 +193,6 @@ st.markdown(
     .alert-off { color: #94A3B8; font-size: 13px; }
     .report-section { margin-top: 12px; padding-top: 12px; border-top: 1px solid #E2E8F0; }
     .report-section-title { color: #0F172A; font-size: 14px; font-weight: 800; }
-    .report-section-sub { color: #64748B; font-size: 11px; margin-top: 2px; }
     .st-key-side_panel {
         background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 16px;
         box-shadow: 0 4px 16px rgba(15,23,42,.06); padding: 20px;
@@ -319,22 +318,6 @@ st.markdown(
     .report-card .report-row span:first-child { color: #94A3B8; }
     .report-card .report-row span:last-child { font-weight: 700; color: #F1F5F9; }
 
-    /* 에스컬레이션 카드 */
-    .esc-header { font-size: 14px; font-weight: 800; color: #0F172A; margin-bottom: 10px; }
-    .esc-row { margin-bottom: 8px; }
-    .esc-row-label { font-size: 11px; color: #64748B; font-weight: 700; text-transform: uppercase;
-                      margin-right: 6px; }
-    .chip {
-        display: inline-flex; align-items: center; gap: 5px; background: #F1F5F9;
-        border: 1px solid #E2E8F0; border-radius: 999px; padding: 3px 11px; margin: 3px 5px 0 0;
-        font-size: 12.5px; font-weight: 600; color: #334155;
-    }
-    .esc-note {
-        margin-top: 6px; font-size: 12.5px; font-weight: 600; border-radius: 8px;
-        padding: 8px 12px; background: var(--grade-bg); color: var(--grade-color);
-        border: 1px solid var(--grade-border);
-    }
-
     /* 등급 범례 */
     .legend-row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 3px 0; color: #111827; }
     .legend-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
@@ -351,20 +334,20 @@ st.markdown(
         background: #FFFFFF; border-radius: 16px;
     }
     /* 입력 컬럼: 68/28 비율, 동일한 기준선과 24px 간격 */
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) {
         display: flex; align-items: flex-end; gap: 24px;
     }
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) > div:first-child {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) > div:first-child {
         flex: 0 1 68%; width: 68%;
     }
-    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stTextInput"]) > div:last-child {
+    [data-testid="stHorizontalBlock"]:has([data-testid="stFileUploader"]):has([data-testid="stSelectbox"]) > div:last-child {
         flex: 0 1 28%; width: 28%;
     }
-    [data-testid="stFileUploader"], [data-testid="stTextInput"] {
+    [data-testid="stFileUploader"], [data-testid="stSelectbox"] {
         width: 100%;
     }
     [data-testid="stFileUploader"] [data-testid="stWidgetLabel"],
-    [data-testid="stTextInput"] [data-testid="stWidgetLabel"] {
+    [data-testid="stSelectbox"] [data-testid="stWidgetLabel"] {
         min-height: 24px; margin-bottom: 6px; display: flex; align-items: center;
     }
     [data-testid="stFileUploaderDropzone"] {
@@ -382,15 +365,10 @@ st.markdown(
     [data-testid="stFileUploaderDropzoneInstructions"] span,
     [data-testid="stFileUploaderDropzoneInstructions"] small { font-size: 12px; }
     [data-testid="stFileUploader"] section { padding: 0; margin: 0; }
-    [data-testid="stTextInput"] input {
-        box-sizing: border-box; height: 56px; min-height: 56px; padding: 0 16px;
-        line-height: 56px; font-size: 15px; background: #F8FAFC; color: #0F172A;
-        border-color: #CBD5E1; border-radius: 12px !important;
-    }
-    [data-testid="stTextInput"] > div,
-    [data-testid="stTextInput"] [data-baseweb="input"] {
-        min-height: 56px; height: 56px; display: flex; align-items: center;
-        border-radius: 12px;
+    [data-testid="stSelectbox"] [data-baseweb="select"] > div {
+        box-sizing: border-box; min-height: 56px; height: 56px; padding: 0 16px;
+        display: flex; align-items: center; font-size: 15px; background: #F8FAFC;
+        color: #0F172A; border-color: #CBD5E1; border-radius: 12px !important;
     }
     [data-testid="stFileUploaderDropzone"] { margin-top: 0; }
     [data-testid="stWidgetLabel"] p { color: #334155; font-weight: 600; font-size: 13px; }
@@ -489,45 +467,6 @@ def load_model():
     return model
 
 
-def channel_badges(channels):
-    """알림 채널 문자열 → (아이콘, 라벨) 배지 목록 (표시 전용)"""
-    badges = []
-    for ch in channels:
-        low = ch.lower()
-        if "로그" in ch:
-            badges.append(("📝", "로그 기록"))
-        if "대시보드" in ch:
-            badges.append(("📊", "Dashboard"))
-        if "이메일" in ch:
-            badges.append(("📧", "Email"))
-        if "팀" in ch and "메시지" in ch:
-            badges.append(("💬", "팀 메시지"))
-        if "slack" in low:
-            badges.append(("🚨", "Slack") if "즉시" in ch else ("💬", "Slack"))
-        if "sms" in low:
-            badges.append(("📱", "SMS"))
-    return badges
-
-
-def target_badges(targets):
-    """알림 대상 문자열 → (아이콘, 라벨) 배지 목록 (표시 전용)"""
-    badges = []
-    for t in targets:
-        if "현장" in t:
-            badges.append(("👷", "현장 담당자"))
-        elif t == "팀":
-            badges.append(("👥", "팀"))
-        elif "관리자" in t or "책임자" in t:
-            badges.append(("👨‍💼", "관리자/책임자"))
-        else:
-            badges.append(("👤", t))
-    return badges
-
-
-def render_chips(badges):
-    return "".join(f"<span class='chip'>{icon} {label}</span>" for icon, label in badges)
-
-
 def kpi_card(icon, label, value):
     st.markdown(
         f"""<div class="kpi-card fade-in">
@@ -537,16 +476,6 @@ def kpi_card(icon, label, value):
             </div>""",
         unsafe_allow_html=True,
     )
-
-
-def notification_result(grade):
-    """등급별 알림 시뮬레이션 문구."""
-    return {
-        "정상": "🟢 점검 로그 저장 완료",
-        "관찰": "🟡 관리자 대시보드 등록 완료",
-        "주의": "🟠 현장 담당자 이메일 발송 완료",
-        "위험": "🔴 Slack 긴급알림 발송 완료",
-    }[grade]
 
 
 def make_ntfy_message(assessment):
@@ -772,7 +701,7 @@ with st.container(border=True):
                  "프레임을 대표 결과로 분석합니다.",
         )
     with col_id:
-        turbine_id = st.text_input("터빈 ID", value="터빈-03")
+        turbine_id = st.selectbox("터빈 ID", TURBINE_IDS, index=2)
 
 
 @st.dialog("테스트 기록 삭제")
