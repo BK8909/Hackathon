@@ -19,7 +19,7 @@ from ultralytics import YOLO
 
 from config import MODEL_PATH
 from severity import (
-    assess_image,
+    assess_image, assess_video,
     CLASSES, GRADE_COLOR, GRADE_BG, GRADE_BORDER,
     GRADE_ACTION, GRADE_GUIDE, CLASS_ICON, CLASS_WEIGHT,
     size_label, score_one,
@@ -28,6 +28,10 @@ from severity import (
 # ===== 설정 =====
 DISPLAY_CONF_MIN = 0.7          # 화면에 표시할 최소 신뢰도 (판정 로직과는 무관, 표시 전용)
 NTFY_TOPIC = "turbine-alarm-1234"
+IMAGE_TYPES = ["jpg", "jpeg", "png"]
+VIDEO_TYPES = ["mp4", "mov", "avi", "mkv"]
+VIDEO_SAMPLE_INTERVAL_SEC = 1.0  # 동영상에서 프레임을 샘플링할 간격
+VIDEO_MAX_FRAMES = 30            # 동영상당 최대 분석 프레임 수 (데모 환경 처리 시간 보호)
 
 st.set_page_config(page_title="나의 터빈일지", page_icon="🌀", layout="wide")
 
@@ -705,28 +709,54 @@ with st.container(border=True):
     st.markdown(
         "<div class='input-card-anchor'></div>"
         "<div class='input-card-title'>점검 입력</div>"
-        "<div class='input-card-sub'>점검 이미지와 관리 대상 터빈을 입력하세요.</div>",
+        "<div class='input-card-sub'>점검 이미지·영상과 관리 대상 터빈을 입력하세요.</div>",
         unsafe_allow_html=True,
     )
     col_in, col_id = st.columns([7, 3], gap="medium")
     with col_in:
-        uploaded = st.file_uploader("터빈 이미지 업로드", type=["jpg", "jpeg", "png"])
+        uploaded = st.file_uploader(
+            "터빈 이미지/영상 업로드", type=IMAGE_TYPES + VIDEO_TYPES,
+            help="영상은 1초 간격으로 최대 30프레임을 샘플링해 가장 위험도가 높은 "
+                 "프레임을 대표 결과로 분석합니다.",
+        )
     with col_id:
         turbine_id = st.text_input("터빈 ID", value="터빈-03")
 
 if uploaded:
+    file_ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    is_video = file_ext in VIDEO_TYPES
+
     # ===== 순차 진행 상태 표시 =====
     with st.status("분석 진행 중...", expanded=True) as status:
-        st.write("🖼️ 이미지 로드 중...")
-        img = Image.open(uploaded).convert("RGB")
-        tmp_path = "_tmp_upload.jpg"
-        img.save(tmp_path)
-        time.sleep(0.3)
+        if is_video:
+            st.write("🎞️ 영상 로드 중...")
+            tmp_path = f"_tmp_upload.{file_ext}"
+            with open(tmp_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            time.sleep(0.3)
 
-        st.write("🔎 YOLO 탐지 진행 중...")
-        result = assess_image(model, tmp_path, turbine_id=turbine_id)
-        yolo_res = result["yolo_result"]
-        time.sleep(0.3)
+            st.write(f"🔎 프레임 샘플링(최대 {VIDEO_MAX_FRAMES}개) 및 YOLO 탐지 진행 중...")
+            result = assess_video(
+                model, tmp_path, turbine_id=turbine_id,
+                sample_interval_sec=VIDEO_SAMPLE_INTERVAL_SEC, max_frames=VIDEO_MAX_FRAMES,
+            )
+            yolo_res = result["yolo_result"]
+            st.write(
+                f"🖼️ 대표 프레임 선정 완료 — {result['timestamp_sec']}초 지점 "
+                f"(총 {result['sampled_frames']}프레임 중 위험도 최고)"
+            )
+            time.sleep(0.3)
+        else:
+            st.write("🖼️ 이미지 로드 중...")
+            img = Image.open(uploaded).convert("RGB")
+            tmp_path = "_tmp_upload.jpg"
+            img.save(tmp_path)
+            time.sleep(0.3)
+
+            st.write("🔎 YOLO 탐지 진행 중...")
+            result = assess_image(model, tmp_path, turbine_id=turbine_id)
+            yolo_res = result["yolo_result"]
+            time.sleep(0.3)
 
         st.write("📐 심각도 계산 중...")
         time.sleep(0.3)
@@ -811,7 +841,13 @@ if uploaded:
             )
             with st.container(key="detection_image_wrap"):
                 st.image(plotted, width="stretch")
-                st.caption(f"※ 화면에는 신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지만 표시됩니다.")
+                caption = f"※ 화면에는 신뢰도 {int(DISPLAY_CONF_MIN*100)}% 이상 탐지만 표시됩니다."
+                if result.get("source") == "video":
+                    caption += (
+                        f" (영상 {result['timestamp_sec']}초 지점 · "
+                        f"샘플링 {result['sampled_frames']}프레임 중 위험도 최고 프레임)"
+                    )
+                st.caption(caption)
 
     with col_res:
         briefing_points, briefing_actions = ai_briefing(result, previous)
