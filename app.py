@@ -20,7 +20,7 @@ from ultralytics import YOLO
 from config import MODEL_PATH
 from severity import (
     assess_image,
-    GRADE_COLOR, GRADE_BG, GRADE_BORDER,
+    CLASSES, GRADE_COLOR, GRADE_BG, GRADE_BORDER,
     GRADE_ACTION, GRADE_GUIDE, CLASS_ICON, CLASS_WEIGHT,
     size_label, score_one,
 )
@@ -431,7 +431,13 @@ st.markdown(
 def load_model():
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
-    return YOLO(str(MODEL_PATH))
+    model = YOLO(str(MODEL_PATH))
+    # 탐지 이미지에 그려지는 라벨(model.plot())은 모델 내부 names를 그대로 쓴다.
+    # 학습 시 클래스명 대소문자/표기가 달라도 대시보드 표기(CLASSES)와 항상 맞도록 덮어쓴다.
+    # model.names는 읽기 전용 프로퍼티라 내부 model.model.names를 직접 바꿔야 한다.
+    if set(model.names.keys()) == set(CLASSES.keys()):
+        model.model.names = dict(CLASSES)
+    return model
 
 
 def channel_badges(channels):
@@ -737,6 +743,18 @@ if uploaded:
 
     st.write("")
 
+    # 위험 등급은 담당자 알림 버튼을 누르지 않아도 ntfy 푸시를 자동 발송한다.
+    # 같은 업로드+터빈ID 조합에서는 재실행(다른 버튼 클릭 등)마다 중복 발송되지
+    # 않도록 file_id로 한 번만 보낸다.
+    auto_alert_key = f"{turbine_id}:{uploaded.file_id}"
+    if grade == "위험" and st.session_state.get("last_auto_alert_key") != auto_alert_key:
+        try:
+            send_ntfy_alert(result)
+            st.session_state.ntfy_status = ("success", None, True)
+        except Exception as e:
+            st.session_state.ntfy_status = ("error", str(e), True)
+        st.session_state.last_auto_alert_key = auto_alert_key
+
     inspected_at = datetime.now()
     previous = next(
         (item for item in st.session_state.history if item["터빈"] == turbine_id),
@@ -844,17 +862,19 @@ if uploaded:
                     if st.button("🔔 담당자 알림", width="stretch", key="notify_manager"):
                         try:
                             send_ntfy_alert(result)
-                            st.session_state.ntfy_status = ("success", None)
+                            st.session_state.ntfy_status = ("success", None, False)
                         except Exception as e:
-                            st.session_state.ntfy_status = ("error", str(e))
+                            st.session_state.ntfy_status = ("error", str(e), False)
 
                 ntfy_status = st.session_state.get("ntfy_status")
                 if ntfy_status is None:
                     st.caption("외부 채널 연동 전")
                 elif ntfy_status[0] == "success":
-                    st.success("ntfy 담당자 알림 발송 완료")
+                    auto_suffix = " (위험 등급 자동 발송)" if ntfy_status[2] else ""
+                    st.success(f"ntfy 담당자 알림 발송 완료{auto_suffix}")
                 else:
-                    st.error(f"알림 발송 실패: {ntfy_status[1]}")
+                    auto_suffix = " (위험 등급 자동 발송 시도)" if ntfy_status[2] else ""
+                    st.error(f"알림 발송 실패{auto_suffix}: {ntfy_status[1]}")
 
                 if st.button("📅 현장점검 예약", width="stretch", key="schedule_inspection"):
                     st.toast("현장점검 예약 요청이 등록되었습니다. (시뮬레이션)")
